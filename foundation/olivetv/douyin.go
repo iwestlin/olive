@@ -3,6 +3,7 @@ package olivetv
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
 	"strings"
@@ -40,36 +41,39 @@ func (this *douyin) Snap(tv *TV) error {
 }
 
 func (this *douyin) set(tv *TV) error {
+	// 获取 ttwid cookie
 	ttwid, err := this.ttwid()
 	if err != nil {
 		return err
 	}
 	cookie := "ttwid=" + ttwid
 
-	api := `https://live.douyin.com/webcast/room/web/enter/`
+	// 生成带 a_bogus 签名的请求参数
+	fg := BrowserFingerprintGenerator{}
+	fp := fg.GenerateFingerprint()
+
+	params := fmt.Sprintf("aid=6383&live_id=1&device_platform=web&language=zh-CN&enter_from=web_live&cookie_enabled=true&screen_width=1920&screen_height=1080&browser_language=zh-CN&browser_platform=MacIntel&browser_name=Chrome&browser_version=108.0.0.0&web_rid=%s&Room-Enter-User-Login-Ab=0&is_need_double_stream=false", tv.RoomID)
+
+	ab := NewABogus()
+	ab.BrowserFp = fp
+	finalParams, abogus := ab.GenerateAbogus(params, "")
+
+	api := `https://live.douyin.com/webcast/room/web/enter/?` + finalParams
+
 	resp, err := req.R().
 		SetHeaders(map[string]string{
-			HeaderUserAgent:   CHROME,
+			HeaderUserAgent:   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
 			"referer":         "https://live.douyin.com/",
 			"cookie":          cookie,
 			"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 			"Accept-Language": "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2",
 			"Cache-Control":   "no-cache",
-		}).
-		SetQueryParams(map[string]string{
-			"aid":              "6383",
-			"device_platform":  "web",
-			"browser_language": "zh-CN",
-			"browser_platform": "Win32",
-			"browser_name":     "Chrome",
-			"browser_version":  "92.0.4515.159",
-			"web_rid":          tv.RoomID,
+			"xBogus":          abogus,
 		}).
 		Get(api)
 	if err != nil {
 		return err
 	}
-	// log.Println(api)
 	text := resp.String()
 
 	if !strings.Contains(text, "data") {
@@ -77,6 +81,11 @@ func (this *douyin) set(tv *TV) error {
 	}
 
 	text = gjson.Get(text, "data.data.0").String()
+
+	// 设置房间信息（无论是否开播）
+	tv.roomName = gjson.Get(text, "title").String()
+	tv.streamerName = gjson.Get(text, "owner.nickname").String()
+
 	// 抖音 status == 2 代表是开播的状态
 	if gjson.Get(text, "status").String() != "2" {
 		return nil
@@ -93,9 +102,6 @@ func (this *douyin) set(tv *TV) error {
 	_ = hls
 	tv.streamURL = flv
 	tv.roomOn = true
-
-	tv.roomName = gjson.Get(text, "title").String()
-	tv.streamerName = gjson.Get(text, "owner.nickname").String()
 
 	return nil
 }

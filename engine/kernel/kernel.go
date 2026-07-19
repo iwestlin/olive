@@ -2,6 +2,7 @@ package kernel
 
 import (
 	"context"
+	"crypto/subtle"
 
 	"github.com/go-olive/olive/engine/config"
 	"github.com/go-olive/olive/engine/dispatcher"
@@ -12,6 +13,16 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/sirupsen/logrus"
 )
+
+// defaultPortalUsername / defaultPortalPassword are the documented defaults
+// shipped with olive. IsValidPortalUser logs a warning when the deployment
+// still uses them so operators get a nudge toward changing credentials.
+const (
+	defaultPortalUsername = "olive"
+	defaultPortalPassword = "olive"
+)
+
+var defaultCredsWarned bool
 
 type Kernel struct {
 	log     *logrus.Logger
@@ -110,8 +121,20 @@ func (k *Kernel) UpdateConfig(key, value string) {
 	}
 }
 
+// IsValidPortalUser compares credentials in constant time to avoid leaking
+// information about the configured username/password via timing side
+// channels. It also emits a one-shot warning when defaults are still in
+// effect, so operators are nudged toward changing them.
 func (k *Kernel) IsValidPortalUser(un, pw string) bool {
-	return k.cfg.PortalUsername == un && k.cfg.PortalPassword == pw
+	if !defaultCredsWarned &&
+		k.cfg.PortalUsername == defaultPortalUsername &&
+		k.cfg.PortalPassword == defaultPortalPassword {
+		k.log.Warn("default portal credentials (olive/olive) are still in use; update core_config to harden the deployment")
+		defaultCredsWarned = true
+	}
+	userOK := subtle.ConstantTimeCompare([]byte(k.cfg.PortalUsername), []byte(un)) == 1
+	passOK := subtle.ConstantTimeCompare([]byte(k.cfg.PortalPassword), []byte(pw)) == 1
+	return userOK && passOK
 }
 
 func (k *Kernel) Run() {

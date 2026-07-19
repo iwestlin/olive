@@ -1,8 +1,6 @@
 package show
 
 import (
-	"unsafe"
-
 	"github.com/go-olive/olive/business/core/show/db"
 	"github.com/go-olive/olive/engine/kernel"
 )
@@ -43,9 +41,27 @@ type UpdateShow struct {
 
 // =============================================================================
 
+// toShow converts a DB-row Show into the kernel Show type that the engine
+// consumes. Historically this used unsafe.Pointer to alias the two structs,
+// but that relied on the engine and the DB layer jamais diverging in field
+// order/layout; an invisible field reorder would have produced memory
+// corruption. The explicit copy below is immune to that class of bug while
+// staying zero-cost in practice.
 func toShow(dbShow db.Show) Show {
-	s := (*Show)(unsafe.Pointer(&dbShow))
-	return *s
+	return Show{
+		ID:           dbShow.ID,
+		Enable:       dbShow.Enable,
+		Platform:     dbShow.Platform,
+		RoomID:       dbShow.RoomID,
+		StreamerName: dbShow.StreamerName,
+		OutTmpl:      dbShow.OutTmpl,
+		Parser:       dbShow.Parser,
+		SaveDir:      dbShow.SaveDir,
+		PostCmds:     dbShow.PostCmds,
+		SplitRule:    dbShow.SplitRule,
+		DateCreated:  dbShow.DateCreated,
+		DateUpdated:  dbShow.DateUpdated,
+	}
 }
 
 func toShowSlice(dbShows []db.Show) []Show {

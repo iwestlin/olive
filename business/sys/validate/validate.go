@@ -24,6 +24,28 @@ var validate *validator.Validate
 // translator is a cache of locale and translation information.
 var translator ut.Translator
 
+// PostCmdWhitelist enumerates the only `path` values the engine is willing
+// to interpret from user-supplied PostCmds. Anything else is rejected at
+// validation time and again at execution time, removing the previous
+// "any path becomes a binary to execute" RCE.
+var PostCmdWhitelist = map[string]bool{
+	"olivetrash":   true,
+	"olivearchive": true,
+	"olivebiliup":  true,
+	"oliveshell":   true,
+}
+
+// PostCmdSchema is the wire shape of an entry inside a show's PostCmds JSON
+// array. We deliberately do NOT unmarshal into exec.Cmd directly because
+// exec.Cmd's exported fields (Path, Args, Env, Dir, Stdin, Stdout, ...) make
+// it look like every field is fair game, and the engine previously fed
+// arbitrary Path values into exec.Command. The explicit schema pins down the
+// only fields the task runner actually consumes.
+type PostCmdSchema struct {
+	Path string   `json:"path"`
+	Args []string `json:"args"`
+}
+
 // emailRegex is the regular expression used to determine if a string is an email.
 // https://github.com/go-playground/validator/blob/v10.10.0/regexes.go#L73
 var emailRegex *regexp.Regexp
@@ -98,13 +120,100 @@ func CheckEmail(email string) bool {
 	return emailRegex.MatchString(email)
 }
 
-// CheckPostCmds validates that the PostCmds format is valid.
+// CheckSafePath rejects path inputs that allow an untrusted caller to
+// escape the recording base directory. The rules are:
+//   - the empty string is allowed (engine falls back to cfg defaults);
+//   - the string must not contain a NUL byte;
+//   - the string must not contain a ".." path component (after splitting on
+//     both / and \, the cross-platform separators Windows and POSIX use);
+//   - the string must not contain a leading "/" or "\" that turns the path
+//     into an absolute one outside any reasonable base directory;
+//   - the rendered template is allowed to produce sub-paths like
+//     "{{ .StreamerName }}/archive/path", but only using single relative
+//     segments -- callers should additionally sanitize after rendering.
+//
+// This is intentionally a heuristic: it covers the obvious traversal
+// attacks without trying to render every possible template early.
+func CheckSafePath(p string) error {
+	if p == "" {
+		return nil
+	}
+	if strings.ContainsRune(p, 0) {
+		return fmt.Errorf("path contains NUL byte: %q", p)
+	}
+	for _, part := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if part == ".." {
+			return fmt.Errorf("path contains parent-directory traversal: %q", p)
+		}
+	}
+	if strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\") {
+		return fmt.Errorf("path must be relative (refusing absolute path): %q", p)
+	}
+	return nil
+}
+
+// CheckSafeFilename is the stricter check applied to the rendered output
+// template. The window for the template is just a top-level filename, so a
+// path separator alone is enough to refuse it.
+func CheckSafeFilename(p string) error {
+	if err := CheckSafePath(p); err != nil {
+		return err
+	}
+	if strings.ContainsRune(p, '/') || strings.ContainsRune(p, '\\') {
+		return fmt.Errorf("filename must not contain a path separator: %q", p)
+	}
+	return nil
+}
+
+// CheckPostCmds validates that the PostCmds format is valid AND that every
+// entry's Path is on the engine's whitelisted set of task types. This is the
+// choke point that prevents an untrusted caller from injecting arbitrary
+// binaries into the engine's post-record execution path.
 func CheckPostCmds(postCmds string) error {
 	if postCmds == "" {
 		return nil
 	}
-	var tmp []exec.Cmd
-	return jsoniter.UnmarshalFromString(postCmds, &tmp)
+	var cmds []PostCmdSchema
+	if err := jsoniter.UnmarshalFromString(postCmds, &cmds); err != nil {
+		return err
+	}
+	for i, c := range cmds {
+		if !PostCmdWhitelist[c.Path] {
+			return fmt.Errorf("post cmds[%d]: unsupported path %q (allowed: olivetrash, olivearchive, olivebiliup, oliveshell)", i, c.Path)
+		}
+		// oliveshell runs an arbitrary binary, so its args must be present
+		// and non-empty. The other three task types ignore Args.
+		if c.Path == "oliveshell" && len(c.Args) == 0 {
+			return fmt.Errorf("post cmds[%d]: oliveshell requires at least one arg (the binary to run)", i)
+		}
+	}
+	return nil
+}
+
+// SafePostCmdUsage records whether the supplied path is on the whitelist.
+func SafePostCmdUsage(path string) bool { return PostCmdWhitelist[path] }
+
+// ToExecCmds converts a verified PostCmds JSON document into []*exec.Cmd
+// instances that the engine already knows how to dispatch. The Cmd.Path
+// field carries the whitelisted task-type identifier (it is NOT a binary
+// path); Cmd.Args carries the args for the oliveshell runner (and the
+// task type itself as Args[0], matching the historical format).
+func ToExecCmds(postCmds string) ([]*exec.Cmd, error) {
+	if postCmds == "" {
+		return nil, nil
+	}
+	if err := CheckPostCmds(postCmds); err != nil {
+		return nil, err
+	}
+	var cmds []PostCmdSchema
+	if err := jsoniter.UnmarshalFromString(postCmds, &cmds); err != nil {
+		return nil, err
+	}
+	out := make([]*exec.Cmd, 0, len(cmds))
+	for _, c := range cmds {
+		out = append(out, &exec.Cmd{Path: c.Path, Args: c.Args})
+	}
+	return out, nil
 }
 
 // CheckSplitRule validates that the SplitRule format is valid.

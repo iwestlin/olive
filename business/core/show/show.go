@@ -21,6 +21,7 @@ var (
 	ErrInvalidID        = errors.New("ID is not in its proper form")
 	ErrInvalidPostCmds  = errors.New("PostCmds is not valid")
 	ErrInvalidSplitRule = errors.New("SplitRule is not valid")
+	ErrInvalidPath      = errors.New("SaveDir/OutTmpl contains an unsafe path")
 )
 
 // Core manages the set of APIs for show access.
@@ -41,6 +42,16 @@ func (c Core) Create(ctx context.Context, newShow NewShow, now time.Time) (Show,
 		return Show{}, fmt.Errorf("validating data: %w", err)
 	}
 
+	// Reject directory-traversal payloads on SaveDir and OutTmpl before the
+	// engine ever touches them. Without this check, a caller could point a
+	// show's SaveDir at "/etc/cron.d" or use "../" to write recordings into
+	// system directories.
+	if err := validate.CheckSafePath(newShow.SaveDir); err != nil {
+		return Show{}, ErrInvalidPath
+	}
+	if err := validate.CheckSafePath(newShow.OutTmpl); err != nil {
+		return Show{}, ErrInvalidPath
+	}
 	if err := validate.CheckPostCmds(newShow.PostCmds); err != nil {
 		return Show{}, ErrInvalidPostCmds
 	}
@@ -124,6 +135,14 @@ func (c Core) Update(ctx context.Context, showID string, updateShow UpdateShow, 
 	}
 	dbShow.DateUpdated = now
 
+	// Apply the same traversal guard to the merged record so an Update can't
+	// sneak a path that wasn't allowed at Create time.
+	if err := validate.CheckSafePath(dbShow.SaveDir); err != nil {
+		return ErrInvalidPath
+	}
+	if err := validate.CheckSafePath(dbShow.OutTmpl); err != nil {
+		return ErrInvalidPath
+	}
 	if err := validate.CheckPostCmds(dbShow.PostCmds); err != nil {
 		return ErrInvalidPostCmds
 	}

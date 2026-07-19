@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/go-olive/olive/business/core/config"
 	"github.com/go-olive/olive/business/core/show"
 	"github.com/go-olive/olive/business/sys/database"
+	"github.com/go-olive/olive/business/web/v1/mid"
 	"github.com/go-olive/olive/engine/kernel"
 	l "github.com/go-olive/olive/engine/log"
 	"github.com/go-olive/olive/foundation/logger"
@@ -43,6 +45,10 @@ type Web struct {
 	ShutdownTimeout time.Duration
 	APIHost         string
 	DebugHost       string
+	TLSCert         string
+	TLSKey          string
+	DebugUser       string
+	DebugPass       string
 }
 
 type DB struct {
@@ -67,12 +73,22 @@ func (b *commandsBuilder) newServerCmd() *serverCmd {
 	}
 	cc.baseBuilderCmd = b.newBuilderCmd(cmd)
 
-	cmd.Flags().DurationVar(&cc.ReadTimeout, "web-read-timeout", 5*time.Second, "")
-	cmd.Flags().DurationVar(&cc.ReadTimeout, "web-write-timeout", 10*time.Second, "")
-	cmd.Flags().DurationVar(&cc.ReadTimeout, "web-idle-timeout", 120*time.Second, "")
-	cmd.Flags().DurationVar(&cc.ReadTimeout, "web-shutdown-timeout", 20*time.Second, "")
-	cmd.Flags().StringVar(&cc.APIHost, "web-api-host", "0.0.0.0:3000", "")
-	cmd.Flags().StringVar(&cc.DebugHost, "web-debug-host", "0.0.0.0:4000", "")
+	// Web server tuning. Defaults now bind to loopback so a fresh deployment
+	// rejects remote connections until an operator opts in with an explicit
+	// 0.0.0.0:* address. Previous code bound the same field (ReadTimeout)
+	// for four different flags by mistake, leaving write/idle/shutdown
+	// timeouts silently fixed at their zero values. Each flag is now wired
+	// to its own field so the config actually takes effect.
+	cmd.Flags().DurationVar(&cc.ReadTimeout, "web-read-timeout", 5*time.Second, "HTTP request read timeout")
+	cmd.Flags().DurationVar(&cc.WriteTimeout, "web-write-timeout", 10*time.Second, "HTTP response write timeout")
+	cmd.Flags().DurationVar(&cc.IdleTimeout, "web-idle-timeout", 120*time.Second, "HTTP keep-alive idle timeout")
+	cmd.Flags().DurationVar(&cc.ShutdownTimeout, "web-shutdown-timeout", 20*time.Second, "graceful shutdown timeout")
+	cmd.Flags().StringVar(&cc.APIHost, "web-api-host", "127.0.0.1:3000", "API service listen address (loopback by default; use 0.0.0.0:3000 to expose)")
+	cmd.Flags().StringVar(&cc.DebugHost, "web-debug-host", "127.0.0.1:4000", "debug/pprof listen address (loopback by default)")
+	cmd.Flags().StringVar(&cc.TLSCert, "web-tls-cert", "", "path to TLS certificate (PEM). When set with --web-tls-key, API serves HTTPS")
+	cmd.Flags().StringVar(&cc.TLSKey, "web-tls-key", "", "path to TLS private key (PEM). When set with --web-tls-cert, API serves HTTPS")
+	cmd.Flags().StringVar(&cc.DebugUser, "web-debug-user", "", "basic-auth user for the debug listener; empty = no basic auth (loopback only)")
+	cmd.Flags().StringVar(&cc.DebugPass, "web-debug-pass", "", "basic-auth password for the debug listener; empty = no basic auth (loopback only)")
 
 	cmd.Flags().StringVar(&cc.User, "db-user", "postgres", "")
 	cmd.Flags().StringVar(&cc.Password, "db-password", "postgres", "")
@@ -89,7 +105,6 @@ func (b *commandsBuilder) newServerCmd() *serverCmd {
 }
 
 func (c *serverCmd) run() error {
-	// Construct the application logger.
 	log, err := logger.New("OLIVE-API")
 	if err != nil {
 		fmt.Println(err)
@@ -97,7 +112,6 @@ func (c *serverCmd) run() error {
 	}
 	defer log.Sync()
 
-	// Perform the startup and shutdown sequence.
 	cfg := cfg{
 		Web: c.Web,
 		DB:  c.DB,
@@ -119,7 +133,6 @@ func (c *serverCmd) serve(log *zap.SugaredLogger, cfg cfg) (err error) {
 
 	// =========================================================================
 	// App Starting
-
 	log.Infow("starting service", "version", build)
 	defer log.Infow("shutdown complete")
 
@@ -132,9 +145,25 @@ func (c *serverCmd) serve(log *zap.SugaredLogger, cfg cfg) (err error) {
 	expvar.NewString("build").Set(build)
 
 	// =========================================================================
-	// Database Support
+	// Hazardous-host guard
+	// Refuse to expose the debug listener on a non-loopback address unless the
+	// operator explicitly configured HTTP Basic-Auth. pprof exposes goroutine
+	// dumps and memory that can leak secrets and acts as a DoS amplification
+	// endpoint when reachable from the internet.
+	if !isLoopbackHost(cfg.Web.DebugHost) && (cfg.Web.DebugUser == "" || cfg.Web.DebugPass == "") {
+		return errors.New("debug listener bound to a non-loopback address without --web-debug-user/--web-debug-pass; refusing to start")
+	}
+	// Likewise refuse to expose the API on a non-loopback address when TLS
+	// is not configured, unless the operator has opted in via explicit
+	// configuration. This keeps admin credentials off plaintext HTTP at the
+	// perimeter of deployments that don't realize the default binding has
+	// changed.
+	if !isLoopbackHost(cfg.Web.APIHost) && cfg.Web.TLSCert == "" && cfg.Web.TLSKey == "" {
+		log.Warnw("startup", "WARNING", "API listening on a non-loopback address without TLS; consider --web-tls-cert/--web-tls-key or a reverse proxy with TLS termination")
+	}
 
-	// Create connectivity to the database.
+	// =========================================================================
+	// Database Support
 	log.Infow("startup", "status", "initializing database support", "host", cfg.DB.Host)
 
 	dbConfig := database.Config{
@@ -154,9 +183,6 @@ func (c *serverCmd) serve(log *zap.SugaredLogger, cfg cfg) (err error) {
 		log.Infow("shutdown", "status", "stopping database support", "host", cfg.DB.Host)
 		db.Close()
 	}()
-
-	// =========================================================================
-	// Database Admin Operation
 
 	if err := commands.Migrate(dbConfig); err != nil {
 		return fmt.Errorf("migrating database: %w", err)
@@ -209,7 +235,6 @@ func (c *serverCmd) serve(log *zap.SugaredLogger, cfg cfg) (err error) {
 
 		select {
 		case <-ctx.Done():
-			// trick, can change the err value even the funciton has returned.
 			newErr := errors.New("engine timeout, force quit")
 			if err != nil {
 				err = fmt.Errorf("%v\n%v", err, newErr)
@@ -221,18 +246,19 @@ func (c *serverCmd) serve(log *zap.SugaredLogger, cfg cfg) (err error) {
 	}()
 
 	// =========================================================================
-	// Start Debug Service
+	// Auth subsystem (sessions + brute-force lockout)
+	sessions, err := mid.NewSessionStore()
+	if err != nil {
+		return fmt.Errorf("initializing session store: %w", err)
+	}
+	lockout := mid.NewLoginLockout()
 
+	// =========================================================================
+	// Start Debug Service
 	log.Infow("startup", "status", "debug v1 router started", "host", cfg.Web.DebugHost)
 
-	// The Debug function returns a mux to listen and serve on for all the debug
-	// related endpoints. This includes the standard library endpoints.
+	debugMux := handlers.DebugMux(build, log, db, cfg.Web.DebugUser, cfg.Web.DebugPass)
 
-	// Construct the mux for the debug calls.
-	debugMux := handlers.DebugMux(build, log, db)
-
-	// Start the service listening for debug requests.
-	// Not concerned with shutting this down with load shedding.
 	go func() {
 		if err := http.ListenAndServe(cfg.Web.DebugHost, debugMux); err != nil {
 			log.Errorw("shutdown", "status", "debug v1 router closed", "host", cfg.Web.DebugHost, "ERROR", err)
@@ -241,23 +267,20 @@ func (c *serverCmd) serve(log *zap.SugaredLogger, cfg cfg) (err error) {
 
 	// =========================================================================
 	// Start API Service
-
 	log.Infow("startup", "status", "initializing API support")
 
-	// Make a channel to listen for an interrupt or terminate signal from the OS.
-	// Use a buffered channel because the signal package requires it.
 	shutdown := make(chan os.Signal, 1)
 	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
 
-	// Construct the mux for the API calls.
 	apiMux := handlers.APIMux(handlers.APIMuxConfig{
 		Shutdown: shutdown,
 		Log:      log,
 		DB:       db,
 		K:        k,
+		Sessions: sessions,
+		Lockout:  lockout,
 	})
 
-	// Construct a server to service the requests against the mux.
 	api := http.Server{
 		Addr:         cfg.Web.APIHost,
 		Handler:      apiMux,
@@ -267,20 +290,19 @@ func (c *serverCmd) serve(log *zap.SugaredLogger, cfg cfg) (err error) {
 		ErrorLog:     zap.NewStdLog(log.Desugar()),
 	}
 
-	// Make a channel to listen for errors coming from the listener. Use a
-	// buffered channel so the goroutine can exit if we don't collect this error.
 	serverErrors := make(chan error, 1)
-
-	// Start the service listening for api requests.
 	go func() {
-		log.Infow("startup", "status", "api router started", "host", api.Addr)
-		serverErrors <- api.ListenAndServe()
+		log.Infow("startup", "status", "api router started", "host", api.Addr, "tls", cfg.Web.TLSCert != "")
+		if cfg.Web.TLSCert != "" && cfg.Web.TLSKey != "" {
+			serverErrors <- api.ListenAndServeTLS(cfg.Web.TLSCert, cfg.Web.TLSKey)
+		} else {
+			serverErrors <- api.ListenAndServe()
+		}
 	}()
 
 	// =========================================================================
 	// Shutdown
 
-	// Blocking main and waiting for shutdown.
 	select {
 	case err := <-serverErrors:
 		return fmt.Errorf("server error: %w", err)
@@ -292,11 +314,9 @@ func (c *serverCmd) serve(log *zap.SugaredLogger, cfg cfg) (err error) {
 		log.Infow("shutdown", "status", "shutdown started", "signal", sig)
 		defer log.Infow("shutdown", "status", "shutdown complete", "signal", sig)
 
-		// Give outstanding requests a deadline for completion.
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.Web.ShutdownTimeout)
 		defer cancel()
 
-		// Asking listener to shut down and shed load.
 		if err := api.Shutdown(ctx); err != nil {
 			api.Close()
 			return fmt.Errorf("could not stop server gracefully: %w", err)
@@ -304,4 +324,22 @@ func (c *serverCmd) serve(log *zap.SugaredLogger, cfg cfg) (err error) {
 	}
 
 	return nil
+}
+
+// isLoopbackHost reports whether the host portion of an "ip:port" listen
+// address refers to a loopback address. Extraneous whitespace and IPv6
+// "[::1]:port" forms are normalized before the comparison.
+func isLoopbackHost(addr string) bool {
+	host := addr
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		host = addr[:i]
+	}
+	host = strings.TrimSpace(host)
+	host = strings.Trim(host, "[]")
+	switch host {
+	case "", "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return strings.HasPrefix(host, "127.")
+	}
 }

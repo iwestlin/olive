@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/go-olive/olive/business/core/config"
 	"github.com/go-olive/olive/business/core/show"
 	"github.com/go-olive/olive/business/sys/database"
+	"github.com/go-olive/olive/business/web/v1/mid"
 	"github.com/go-olive/olive/engine/kernel"
 	l "github.com/go-olive/olive/engine/log"
 	"github.com/go-olive/olive/foundation/logger"
@@ -55,8 +57,18 @@ func run(log *zap.SugaredLogger) error {
 			WriteTimeout    time.Duration `conf:"default:10s"`
 			IdleTimeout     time.Duration `conf:"default:120s"`
 			ShutdownTimeout time.Duration `conf:"default:20s"`
-			APIHost         string        `conf:"default:0.0.0.0:3000"`
-			DebugHost       string        `conf:"default:0.0.0.0:4000"`
+			// Defaults bind to loopback so a fresh deployment refuses remote
+			// connections until an operator opts in with an explicit
+			// 0.0.0.0:* address.
+			APIHost   string `conf:"default:127.0.0.1:3000"`
+			DebugHost string `conf:"default:127.0.0.1:4000"`
+			TLSCert   string `conf:"default:"`
+			TLSKey    string `conf:"default:"`
+			// When set together, the debug listener is gated with HTTP
+			// Basic-Auth; if either is empty AND DebugHost is loopback the
+			// debug surface remains open only to local callers.
+			DebugUser string `conf:"default:"`
+			DebugPass string `conf:"default:,mask"`
 		}
 		DB struct {
 			User         string `conf:"default:postgres"`
@@ -161,11 +173,19 @@ func run(log *zap.SugaredLogger) error {
 
 	log.Infow("startup", "status", "debug v1 router started", "host", cfg.Web.DebugHost)
 
+	// Refuse to expose pprof / expvar without authentication on a
+	// non-loopback interface: those endpoints leak goroutine snapshots, heap
+	// data and live connection credentials, and offer trivial DoS via expensive
+	// profiles.
+	if !isLoopbackHost(cfg.Web.DebugHost) && (cfg.Web.DebugUser == "" || cfg.Web.DebugPass == "") {
+		return errors.New("debug listener bound to a non-loopback address without OLIVE_WEB_DEBUGUSER / OLIVE_WEB_DEBUGPASS; refusing to start")
+	}
+
 	// The Debug function returns a mux to listen and serve on for all the debug
 	// related endpoints. This includes the standard library endpoints.
 
 	// Construct the mux for the debug calls.
-	debugMux := handlers.DebugMux(build, log, db)
+	debugMux := handlers.DebugMux(build, log, db, cfg.Web.DebugUser, cfg.Web.DebugPass)
 
 	// Start the service listening for debug requests.
 	// Not concerned with shutting this down with load shedding.
@@ -180,10 +200,24 @@ func run(log *zap.SugaredLogger) error {
 
 	log.Infow("startup", "status", "initializing API support")
 
+	// Warn if the API listener is exposed without TLS so operators get a
+	// nudge toward running the service behind TLS termination.
+	if !isLoopbackHost(cfg.Web.APIHost) && cfg.Web.TLSCert == "" && cfg.Web.TLSKey == "" {
+		log.Warnw("startup", "WARNING", "API listening on a non-loopback address without TLS; consider setting TLSCert/TLSKey or fronting olive-api with a TLS-terminating reverse proxy")
+	}
+
 	// Make a channel to listen for an interrupt or terminate signal from the OS.
 	// Use a buffered channel because the signal package requires it.
 	shutdown := make(chan os.Signal, 1)
 	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
+
+	// Build the auth subsystem: a per-process secret for HMAC-signed session
+	// cookies plus a brute-force lockout tracker.
+	sessions, err := mid.NewSessionStore()
+	if err != nil {
+		return fmt.Errorf("initializing session store: %w", err)
+	}
+	lockout := mid.NewLoginLockout()
 
 	// Construct the mux for the API calls.
 	apiMux := handlers.APIMux(handlers.APIMuxConfig{
@@ -191,6 +225,8 @@ func run(log *zap.SugaredLogger) error {
 		Log:      log,
 		DB:       db,
 		K:        k,
+		Sessions: sessions,
+		Lockout:  lockout,
 	})
 
 	// Construct a server to service the requests against the mux.
@@ -207,10 +243,16 @@ func run(log *zap.SugaredLogger) error {
 	// buffered channel so the goroutine can exit if we don't collect this error.
 	serverErrors := make(chan error, 1)
 
-	// Start the service listening for api requests.
+	// Start the service listening for api requests. Honor TLS when the
+	// operator supplied a cert/key pair so admin credentials don't travel
+	// over plaintext HTTP at the perimeter.
 	go func() {
-		log.Infow("startup", "status", "api router started", "host", api.Addr)
-		serverErrors <- api.ListenAndServe()
+		log.Infow("startup", "status", "api router started", "host", api.Addr, "tls", cfg.Web.TLSCert != "")
+		if cfg.Web.TLSCert != "" && cfg.Web.TLSKey != "" {
+			serverErrors <- api.ListenAndServeTLS(cfg.Web.TLSCert, cfg.Web.TLSKey)
+		} else {
+			serverErrors <- api.ListenAndServe()
+		}
 	}()
 
 	// =========================================================================
@@ -237,4 +279,22 @@ func run(log *zap.SugaredLogger) error {
 	}
 
 	return nil
+}
+
+// isLoopbackHost reports whether the host portion of an "ip:port" listen
+// address refers to a loopback address. Extraneous whitespace and IPv6
+// "[::1]:port" forms are normalized before the comparison.
+func isLoopbackHost(addr string) bool {
+	host := addr
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		host = addr[:i]
+	}
+	host = strings.TrimSpace(host)
+	host = strings.Trim(host, "[]")
+	switch host {
+	case "", "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return strings.HasPrefix(host, "127.")
+	}
 }

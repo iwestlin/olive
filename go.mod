@@ -2,7 +2,7 @@ module github.com/go-olive/olive
 
 go 1.24.0
 
-toolchain go1.24.11
+toolchain go1.24.10
 
 require (
 	github.com/Masterminds/sprig v2.22.0+incompatible
@@ -36,6 +36,7 @@ require (
 	github.com/tjfoc/gmsm v1.4.1
 	go.uber.org/zap v1.23.0
 	golang.org/x/net v0.47.0
+	golang.org/x/text v0.32.0
 	golang.org/x/time v0.0.0-20191024005414-555d28b269f0
 	rsc.io/qr v0.2.0
 )
@@ -89,8 +90,8 @@ require (
 	golang.org/x/crypto v0.44.0 // indirect
 	golang.org/x/exp v0.0.0-20230817173708-d852ddb80c63 // indirect
 	golang.org/x/mod v0.30.0 // indirect
+	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
-	golang.org/x/text v0.32.0 // indirect
 	golang.org/x/tools v0.39.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect

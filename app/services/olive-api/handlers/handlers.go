@@ -17,14 +17,11 @@ import (
 	"go.uber.org/zap"
 )
 
-// DebugStandardLibraryMux registers all the debug routes from the standard library
-// into a new mux bypassing the use of the DefaultServerMux. Using the
-// DefaultServerMux would be a security risk since a dependency could inject a
-// handler into our service without us knowing it.
+// DebugStandardLibraryMux registers all the debug routes from the standard lib
+// into a new mux, bypassing the use of the DefaultServerMux.
 func DebugStandardLibraryMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
-	// Register all the standard library debug endpoints.
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
@@ -36,13 +33,12 @@ func DebugStandardLibraryMux() *http.ServeMux {
 }
 
 // DebugMux registers all the debug standard library routes and then custom
-// debug application routes for the service. This bypassing the use of the
-// DefaultServerMux. Using the DefaultServerMux would be a security risk since
-// a dependency could inject a handler into our service without us knowing it.
-func DebugMux(build string, log *zap.SugaredLogger, db *sqlx.DB) http.Handler {
+// debug application routes for the service. If basicUser/basicPass are both
+// non-empty the mux is wrapped in HTTP Basic-Auth so pprof/expvar are not
+// exposed unauthenticated.
+func DebugMux(build string, log *zap.SugaredLogger, db *sqlx.DB, basicUser, basicPass string) http.Handler {
 	mux := DebugStandardLibraryMux()
 
-	// Register debug check endpoints.
 	cgh := checkgrp.Handlers{
 		Build: build,
 		Log:   log,
@@ -51,7 +47,25 @@ func DebugMux(build string, log *zap.SugaredLogger, db *sqlx.DB) http.Handler {
 	mux.HandleFunc("/debug/readiness", cgh.Readiness)
 	mux.HandleFunc("/debug/liveness", cgh.Liveness)
 
+	if basicUser != "" && basicPass != "" {
+		return basicAuth(mux, basicUser, basicPass)
+	}
 	return mux
+}
+
+// basicAuth wraps h with HTTP Basic authentication using constant-time
+// comparison. An empty u/p pair means: do not gate (assume operator bound
+// the debug listener to a loopback address only).
+func basicAuth(h http.Handler, user, pass string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u, p, ok := r.BasicAuth()
+		if !ok || !mid.ConstantTimeEqual(u, user) || !mid.ConstantTimeEqual(p, pass) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="olive-debug"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // APIMuxConfig contains all the mandatory systems required by handlers.
@@ -60,12 +74,18 @@ type APIMuxConfig struct {
 	Log      *zap.SugaredLogger
 	DB       *sqlx.DB
 	K        *kernel.Kernel
+
+	// Sessions signs and verifies login session cookies.
+	Sessions *mid.SessionStore
+	// Lockout rate-limits brute-force attempts on /v1/user/login.
+	Lockout *mid.LoginLockout
 }
 
-// APIMux constructs an http.Handler with all application routes defined.
+// APIMux constructs an http.Handler with all application routes defined. The
+// outer middleware chain runs Logger -> Errors -> Panics, then the v1
+// route group attaches Authenticate to the routes that require a valid
+// session.
 func APIMux(cfg APIMuxConfig) *web.App {
-
-	// Construct the web.App which holds all routes.
 	app := web.NewApp(
 		cfg.Shutdown,
 		mid.Logger(cfg.Log),
@@ -73,11 +93,13 @@ func APIMux(cfg APIMuxConfig) *web.App {
 		mid.Panics(),
 	)
 
-	// Load the v1 routes.
 	v1.Routes(app, v1.Config{
-		Log: cfg.Log,
-		DB:  cfg.DB,
-		K:   cfg.K,
+		Log:      cfg.Log,
+		DB:       cfg.DB,
+		K:        cfg.K,
+		Sessions: cfg.Sessions,
+		Lockout:  cfg.Lockout,
+		Auth:     mid.Authenticate(cfg.Sessions),
 	})
 
 	return app

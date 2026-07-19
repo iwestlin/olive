@@ -35,6 +35,11 @@ func (h Handlers) Create(ctx context.Context, w http.ResponseWriter, r *http.Req
 
 	s, err := h.Show.Create(ctx, newShow, v.Now)
 	if err != nil {
+		if errors.Is(err, show.ErrInvalidPath) ||
+			errors.Is(err, show.ErrInvalidPostCmds) ||
+			errors.Is(err, show.ErrInvalidSplitRule) {
+			return v1Web.NewRequestError(err, http.StatusBadRequest)
+		}
 		return fmt.Errorf("show[%+v]: %w", &s, err)
 	}
 
@@ -60,7 +65,8 @@ func (h Handlers) Update(ctx context.Context, w http.ResponseWriter, r *http.Req
 	if err := h.Show.Update(ctx, showID, upd, v.Now); err != nil {
 		switch {
 		case errors.Is(err, show.ErrInvalidPostCmds),
-			errors.Is(err, show.ErrInvalidSplitRule):
+			errors.Is(err, show.ErrInvalidSplitRule),
+			errors.Is(err, show.ErrInvalidPath):
 			return v1Web.NewRequestError(err, http.StatusBadRequest)
 		case errors.Is(err, show.ErrNotFound):
 			return v1Web.NewRequestError(err, http.StatusNotFound)

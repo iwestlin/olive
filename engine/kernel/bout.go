@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-dora/filenamify"
+	"github.com/go-olive/olive/business/sys/validate"
 	"github.com/go-olive/olive/engine/config"
 	"github.com/go-olive/olive/engine/dispatcher"
 	"github.com/go-olive/olive/engine/enum"
@@ -17,7 +18,6 @@ import (
 	"github.com/go-olive/olive/engine/util"
 	"github.com/go-olive/olive/foundation/olivetv"
 	"github.com/go-olive/olive/foundation/syncmap"
-	jsoniter "github.com/json-iterator/go"
 )
 
 var (
@@ -200,6 +200,12 @@ func (b *bout) GetSaveDir() string {
 	return buf.String()
 }
 
+// GetPostCmds returns the verified post-record task list for this show. It
+// delegates to validate.ToExecCmds so that the engine never trusts raw
+// JSON straight from the database: any entry whose Path is not on the
+// whitelist (olivetrash/olivearchive/olivebiliup/oliveshell) is rejected,
+// closing the historical RCE vector where any string could turn into an
+// arbitary binary path passed to exec.Command.
 func (b *bout) GetPostCmds() []*exec.Cmd {
 	b.Refresh()
 
@@ -207,8 +213,9 @@ func (b *bout) GetPostCmds() []*exec.Cmd {
 	if !ok {
 		return nil
 	}
-	var cmds []*exec.Cmd
-	if err := jsoniter.UnmarshalFromString(s.PostCmds, &cmds); err != nil {
+	cmds, err := validate.ToExecCmds(s.PostCmds)
+	if err != nil {
+		l.Logger.WithError(err).Warn("invalid post cmds ignored")
 		return nil
 	}
 	return cmds

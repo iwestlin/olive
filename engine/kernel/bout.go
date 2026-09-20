@@ -103,8 +103,6 @@ func (b *bout) GetRoomID() string {
 }
 
 func (b *bout) GetStreamerName() string {
-	b.Snap()
-
 	streamerName := b.show.StreamerName
 	if streamerName == "" {
 		streamerName, _ = b.StreamerName()

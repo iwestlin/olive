@@ -118,28 +118,22 @@ func (r *recorder) record() error {
 		r.SubmitUploadTask(out, r.bout.GetPostCmds())
 	}()
 
-	const retry = 3
 	var streamURL string
-	var ok bool
-	for i := 0; i < retry; i++ {
-		err := r.bout.Snap()
-		if err == nil {
-			if streamURL, ok = r.bout.StreamURL(); ok {
-				break
-			} else {
-				err = errors.New("empty stream url")
-			}
-		}
+	if err := r.bout.Snap(); err != nil {
 		r.log.WithFields(logrus.Fields{
-			"pf":  r.bout.GetPlatform(),
-			"id":  r.bout.GetRoomID(),
-			"cnt": i + 1,
+			"pf": r.bout.GetPlatform(),
+			"id": r.bout.GetRoomID(),
 		}).Errorf("snap failed, %s", err.Error())
-
-		if i == retry-1 {
-			return err
-		}
-		time.Sleep(5 * time.Second)
+		return err
+	}
+	streamURL, ok := r.bout.StreamURL()
+	if !ok {
+		errEmptyStreamURL := errors.New("empty stream url")
+		r.log.WithFields(logrus.Fields{
+			"pf": r.bout.GetPlatform(),
+			"id": r.bout.GetRoomID(),
+		}).Errorf("snap failed, %s", errEmptyStreamURL.Error())
+		return errEmptyStreamURL
 	}
 
 	roomName, _ := r.bout.RoomName()
